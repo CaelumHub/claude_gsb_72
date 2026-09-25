@@ -14,7 +14,7 @@
     <main class="content">
       <div class="page-head">
         <h1>网络设置</h1>
-        <p>配置 API 接入点、P2P 邻居节点与共识/挖矿参数，并触发链同步。</p>
+        <p>配置 API 接入点、P2P 邻居节点，调整本节点运行参数（范围校验、留痕、即时生效、一键还原默认），并触发链同步。</p>
       </div>
 
       <div class="grid" style="grid-template-columns: 1fr 1fr; margin-top:0;">
@@ -55,13 +55,24 @@
 
       <div class="grid" style="grid-template-columns: 1fr 1fr; margin-top:16px;">
         <div class="card">
-          <h2>共识 / 挖矿参数</h2>
-          <div class="field"><label>挖矿间隔（秒）</label>
-            <input id="miningInterval" type="number" min="0.2" step="0.1"></div>
-          <div class="field"><label>自动挖矿</label>
-            <select id="autoMine"><option value="1">开启</option><option value="0">关闭</option></select></div>
-          <button class="btn primary" onclick="saveParams()">保存参数</button>
-          <div class="hint" style="margin-top:10px;">难度调整、出块奖励等核心共识参数由后端 config 固定，保证全网一致。</div>
+          <div class="flex">
+            <h2 style="margin:0;">节点运行参数</h2>
+            <div class="spacer"></div>
+            <button class="btn ghost sm" onclick="loadConfig()">刷新</button>
+          </div>
+          <p class="hint" style="margin:6px 0;">以下均为<b>仅影响本节点</b>的运行参数，保存即对后续挖矿/打包/合约执行生效，节点不重启、网络不中断。</p>
+          <div id="paramForm" style="margin-top:10px;"></div>
+          <div class="flex" style="margin-top:12px;">
+            <button class="btn primary" onclick="saveParams()">💾 保存参数（即时生效）</button>
+            <button class="btn amber" onclick="resetParams()">↺ 一键还原默认</button>
+            <span id="paramDirty" class="hint"></span>
+          </div>
+          <div class="hint" style="margin-top:10px;">每项标注当前值与默认值，范围之外的修改会被拒绝且不会保存；保存后可在下方“修改记录”中追溯。</div>
+          <div class="field" style="margin-top:14px;">
+            <label>自动挖矿</label>
+            <select id="autoMine"><option value="1">开启</option><option value="0">关闭</option></select>
+          </div>
+          <button class="btn ghost sm" onclick="saveAutoMine()">应用开关</button>
         </div>
 
         <div class="card">
@@ -69,7 +80,18 @@
           <p class="hint" style="margin:6px 0;">向邻居拉取最重链，落后节点将补齐区块，冲突时触发重组。</p>
           <button class="btn green" onclick="syncNow()">🔄 立即同步</button>
           <div id="syncResult" style="margin-top:12px;"></div>
+          <div class="hint" style="margin-top:14px;">难度调整、出块奖励等<b>核心共识参数</b>由后端固定以保证全网一致，仍在左侧“节点配置”中只读展示，不可调参。</div>
         </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="flex">
+          <h2 style="margin:0;">参数修改记录</h2>
+          <div class="spacer"></div>
+          <button class="btn ghost sm" onclick="loadHistory()">刷新</button>
+        </div>
+        <p class="hint" style="margin:6px 0;">记录每次成功保存：何时、把哪项参数、从多少改成了多少（最多保留最近 500 条）。</p>
+        <div id="historyTable" class="table-wrap" style="margin-top:12px;"></div>
       </div>
     </main>
   </div>
@@ -80,25 +102,214 @@
 <script>
 window.PAGE = "network";
 
+let paramSpecs = [];   // server-provided metadata (key/current/default/range)
+
 async function init() {
   $("#apiBase").value = API.base();
   await loadConfig();
   await loadPeers();
+  await loadHistory();
   pollStatus(8000);
 }
 
 async function loadConfig() {
   const c = await API.get("/api/network/config");
+  // Read-only consensus / network display (unchanged surface).
   $("#configInfo").innerHTML = `
     <dt>节点 ID</dt><dd class="mono">${esc(c.node_id)}</dd>
     <dt>监听地址</dt><dd class="mono">${esc(c.host)}:${c.port}</dd>
     <dt>数据目录</dt><dd class="mono">${esc(c.data_dir)}</dd>
     <dt>初始难度</dt><dd class="mono-num">${c.initial_difficulty}</dd>
     <dt>出块奖励</dt><dd class="mono-num">${c.coinbase_reward} LC</dd>
-    <dt>每块交易上限</dt><dd class="mono-num">${c.max_tx_per_block}</dd>
-    <dt>沙箱超时</dt><dd class="mono-num">${c.sandbox_timeout} s</dd>`;
-  $("#miningInterval").value = c.mining_interval;
+    <dt>每块交易上限（当前生效值）</dt><dd class="mono-num">${c.max_tx_per_block}</dd>
+    <dt>沙箱超时（当前生效值）</dt><dd class="mono-num">${c.sandbox_timeout} s</dd>`;
   $("#autoMine").value = c.mining ? "1" : "0";
+  paramSpecs = c.params || [];
+  renderParams();
+}
+
+function renderParams() {
+  const box = $("#paramForm");
+  if (!paramSpecs.length) {
+    box.innerHTML = `<div class="empty">暂无可调参数</div>`;
+    return;
+  }
+  box.innerHTML = paramSpecs.map(p => {
+    const step = p.step != null ? p.step : (p.type === "int" ? 1 : 0.1);
+    return `
+    <div class="param-row" data-key="${esc(p.key)}" style="padding:10px 0;border-bottom:1px solid var(--border);">
+      <div class="flex" style="align-items:flex-start;">
+        <div style="flex:1;min-width:0;">
+          <label>${esc(p.label)} <span class="muted small mono">${esc(p.key)}</span></label>
+          <div class="hint">${esc(p.help || "")}</div>
+        </div>
+        <div class="param-values muted small mono" style="white-space:nowrap;text-align:right;">
+          默认 <span class="param-default" style="color:var(--muted);">${fmtVal(p, p.default)}</span>
+          ｜ 范围 ${fmtVal(p, p.min)} ~ ${fmtVal(p, p.max)} ${esc(p.unit)}
+        </div>
+      </div>
+      <div class="row" style="margin-top:8px;align-items:center;">
+        <div class="field" style="margin:0;max-width:220px;">
+          <input class="param-input mono" data-key="${esc(p.key)}" type="number"
+                 min="${p.min}" max="${p.max}" step="${step}"
+                 value="${p.current}">
+        </div>
+        <span class="muted small">${esc(p.unit)}</span>
+        <span class="param-current badge gray" data-key="${esc(p.key)}">当前 ${fmtVal(p, p.current)}</span>
+        <span class="param-state small" data-key="${esc(p.key)}"></span>
+      </div>
+    </div>`;
+  }).join("");
+  // Live local comparison vs. default and range; the backend is the source
+  // of truth and re-validates on save.
+  $$("#paramForm .param-input").forEach(inp =>
+    inp.addEventListener("input", () => onParamInput(inp)));
+  refreshDirtyHint();
+}
+
+function specOf(key) { return paramSpecs.find(p => p.key === key); }
+function fmtVal(p, v) {
+  const n = Number(v);
+  if (p.type === "int") return String(Math.trunc(n));
+  // Trim trailing zeros like the backend's %g formatting (3.0 -> "3").
+  return String(Math.round(n * 1000) / 1000);
+}
+
+function readParamInput(inp) {
+  const p = specOf(inp.dataset.key);
+  const raw = inp.value.trim();
+  if (raw === "") return { ok: false, msg: "不能为空" };
+  const v = Number(raw);
+  if (!Number.isFinite(v)) return { ok: false, msg: "必须是数字" };
+  if (p.type === "int" && !Number.isInteger(v)) return { ok: false, msg: "必须是整数" };
+  return { ok: true, value: v };
+}
+
+function onParamInput(inp) {
+  const key = inp.dataset.key, p = specOf(key);
+  const stateEl = $(`.param-state[data-key="${CSS.escape(key)}"]`);
+  const curBadge = $(`.param-current[data-key="${CSS.escape(key)}"]`);
+  const parsed = readParamInput(inp);
+  inp.style.borderColor = "";
+  if (!parsed.ok) {
+    stateEl.innerHTML = `<span class="badge red">${esc(parsed.msg)}</span>`;
+  } else {
+    const v = parsed.value;
+    if (v < p.min || v > p.max) {
+      stateEl.innerHTML = `<span class="badge red">超出 ${fmtVal(p, p.min)}~${fmtVal(p, p.max)}</span>`;
+    } else {
+      stateEl.innerHTML = "";
+    }
+    curBadge.textContent = "当前 " + fmtVal(p, v);
+    curBadge.className = "param-current badge " +
+      (v === p.default ? "gray" : (v === p.current ? "blue" : "amber"));
+  }
+  refreshDirtyHint();
+}
+
+function collectParams() {
+  const updates = {}, errors = [];
+  $$("#paramForm .param-input").forEach(inp => {
+    const key = inp.dataset.key, p = specOf(key);
+    const parsed = readParamInput(inp);
+    if (!parsed.ok || parsed.value < p.min || parsed.value > p.max) {
+      inp.style.borderColor = "var(--red)";
+      errors.push(`${p.label}：${parsed.ok ? "超出合法范围" : parsed.msg}`);
+      return;
+    }
+    // Only send values that differ from the current value.
+    if (parsed.value !== Number(p.current)) updates[key] = parsed.value;
+  });
+  return { updates, errors };
+}
+
+function refreshDirtyHint() {
+  const { updates } = collectParamsSafe();
+  const n = Object.keys(updates).length;
+  $("#paramDirty").textContent = n ? `有 ${n} 项待保存` : "";
+}
+
+// Like collectParams but without flagging borders (used for the hint).
+function collectParamsSafe() {
+  const updates = {};
+  $$("#paramForm .param-input").forEach(inp => {
+    const key = inp.dataset.key, p = specOf(key);
+    const v = Number(inp.value);
+    if (Number.isFinite(v) && (p.type !== "int" || Number.isInteger(v))
+        && v >= p.min && v <= p.max && v !== Number(p.current)) {
+      updates[key] = v;
+    }
+  });
+  return { updates };
+}
+
+async function saveParams() {
+  const { updates, errors } = collectParams();
+  if (errors.length) {
+    return toast("以下参数未通过校验，已拒绝保存：\n" + errors.join("；"), "err", 4200);
+  }
+  if (!Object.keys(updates).length) return toast("参数未变化，无需保存", "info");
+  let d;
+  try {
+    d = await API.post("/api/network/config", { params: updates });
+  } catch (e) {
+    // Backend re-validates atomically; show every offending field.
+    const errs = (e.data && e.data.errors) || {};
+    const detail = Object.entries(errs)
+      .map(([k, m]) => `${(specOf(k) || {label: k}).label}：${m}`).join("；");
+    return toast("保存被拒绝：" + (detail || e.message), "err", 4200);
+  }
+  toast("已即时生效：" + (d.changed.length ? d.changed.join(", ") : "无变化"), "ok");
+  await loadConfig();
+  await loadHistory();
+  renderTopbar();
+}
+
+async function resetParams() {
+  const changed = paramSpecs.filter(p => Number(p.current) !== Number(p.default));
+  if (!changed.length) return toast("所有参数已是默认值", "info");
+  const names = changed.map(p => p.label).join("、");
+  // One explicit confirmation guards the one-click restore against mis-clicks.
+  if (!confirm(`确定将以下参数一键还原为默认值？\n\n${names}\n\n保存后立即对后续挖矿/打包/合约执行生效，节点不中断。`)) return;
+  let d;
+  try {
+    d = await API.post("/api/network/params/reset");
+  } catch (e) {
+    return toast("还原失败：" + e.message, "err");
+  }
+  toast("已还原默认：" + (d.reset.length ? d.reset.join(", ") : "无变化"), "ok");
+  await loadConfig();
+  await loadHistory();
+  renderTopbar();
+}
+
+async function saveAutoMine() {
+  const auto_mine = $("#autoMine").value === "1";
+  const d = await API.post("/api/network/config", { auto_mine });
+  toast("自动挖矿已" + (auto_mine ? "开启" : "停止"), "ok");
+  renderTopbar();
+}
+
+async function loadHistory() {
+  const d = await API.get("/api/network/params/history?limit=100");
+  const box = $("#historyTable");
+  if (!d.history.length) {
+    box.innerHTML = `<div class="empty">暂无参数修改记录</div>`;
+    return;
+  }
+  box.innerHTML = `<table><thead><tr>
+    <th>时间</th><th>参数</th><th>原值</th><th></th><th>新值</th><th>来源</th></tr></thead>
+    <tbody>${d.history.map(h => {
+      const p = specOf(h.key) || { label: h.key, unit: "" };
+      return `<tr>
+        <td class="muted small">${fmt.time(h.time)}</td>
+        <td>${esc(p.label)} <span class="muted small mono">${esc(h.key)}</span></td>
+        <td class="mono-num">${fmtVal(p, h.old)} ${esc(p.unit)}</td>
+        <td class="muted">→</td>
+        <td class="mono-num" style="color:var(--accent);">${fmtVal(p, h.new)} ${esc(p.unit)}</td>
+        <td class="muted small">${esc(h.source || "ui")}</td>
+      </tr>`;
+    }).join("")}</tbody></table>`;
 }
 
 async function loadPeers() {
@@ -147,14 +358,6 @@ async function removePeer(host, port) {
   const d = await API.post("/api/network/remove_peer", { host, port });
   toast(d.ok ? "已移除邻居" : "移除失败", d.ok ? "ok" : "err");
   await loadPeers();
-}
-
-async function saveParams() {
-  const mining_interval = parseFloat($("#miningInterval").value);
-  const auto_mine = $("#autoMine").value === "1";
-  const d = await API.post("/api/network/config", { mining_interval, auto_mine });
-  toast("已保存: " + (d.changed.length ? d.changed.join(", ") : "无变化"), "ok");
-  await loadConfig();
 }
 
 async function syncNow() {

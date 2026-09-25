@@ -103,6 +103,10 @@ class ContractEngine:
         self.max_events = cfg.get("CONTRACT_MAX_EVENTS", 1000)
         self.max_print = cfg.get("SANDBOX_MAX_PRINT", 50_000)
 
+    def _sandbox_timeout(self):
+        # Read live so an admin tuning SANDBOX_TIMEOUT applies immediately.
+        return self.cfg.get("SANDBOX_TIMEOUT", 3.0)
+
     # -- context ----------------------------------------------------------- #
     def build_context(self, world_state, contract_addr, sender, value, height):
         contract = world_state.contract(contract_addr)
@@ -173,9 +177,11 @@ class ContractEngine:
         if constructor:
             # Expect an ``init`` function taking the constructor args.
             res = call_function(code, "init", list(constructor), ctx,
-                                output_limit=self.max_print)
+                               output_limit=self.max_print,
+                               timeout=self._sandbox_timeout())
         else:
-            res = exec_restricted(code, ctx, output_limit=self.max_print)
+            res = exec_restricted(code, ctx, output_limit=self.max_print,
+                                 timeout=self._sandbox_timeout())
 
         result["output"] = res["output"]
         if not res["ok"]:
@@ -202,7 +208,8 @@ class ContractEngine:
         context, events, transfers = self.build_context(
             world_state, contract_addr, sender, value, height)
         res = call_function(contract["code"], function, list(args), context,
-                            output_limit=self.max_print)
+                            output_limit=self.max_print,
+                            timeout=self._sandbox_timeout())
         result["output"] = res["output"]
         if not res["ok"]:
             result["error"] = res["error"]

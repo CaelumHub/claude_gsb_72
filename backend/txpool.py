@@ -27,6 +27,15 @@ class TxPool:
         self._order = []         # txids in arrival order
         self._by_sender = {}     # sender -> txid (one pending tx per sender)
 
+    def set_max_size(self, max_size):
+        """Adjust the admission cap at runtime, evicting the oldest excess."""
+        self.max_size = max(1, int(max_size))
+        while self.size() > self.max_size and self._order:
+            oldest = self._order.pop(0)
+            evicted = self._pool.pop(oldest, None)
+            if evicted is not None:
+                self._by_sender.pop(evicted.sender, None)
+
     # ------------------------------------------------------------------ #
     # Access
     # ------------------------------------------------------------------ #

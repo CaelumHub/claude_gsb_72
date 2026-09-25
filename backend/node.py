@@ -13,7 +13,8 @@ from . import crypto, pow as pow_mod
 from .block import Block
 from .blockchain import Blockchain
 from .config import (COINBASE_REWARD, CONTRACT_EVENT_DEDUP_KEY,
-                     MAX_TX_PER_BLOCK, MINING_INTERVAL)
+                     TUNABLE_PARAM_SPECS, coerce_param, tunable_defaults,
+                     validate_param)
 from .p2p import PeerRegistry, dial_peer, http_get_json, http_post_json
 from .state import ZERO_ADDRESS
 from .storage import DataPaths, atomic_write_json, read_json
@@ -41,10 +42,23 @@ class Node:
         self._mining = False
         self._mine_thread = None
         self._lock = threading.RLock()
+        # Set when mining should wake early (stop requested, or the interval
+        # parameter changed) so parameter updates take effect on the very next
+        # wait instead of after an in-progress sleep completes.
+        self._mining_wake = threading.Event()
         self._logs = []
         self.hashrate = 0.0
         self._last_mine_duration = 0.0
         self._last_mine_attempts = 0
+
+        # Node-local tunable parameters (operational, non-consensus).  Values
+        # persist across restarts in settings.json; every accepted change is
+        # appended to param_history.json for audit.
+        self._param_history = []
+        self._load_param_settings()
+        # The pool is constructed before saved settings are loaded; bring its
+        # admission cap in line with the (possibly persisted) tunable value.
+        self.txpool.set_max_size(int(self.cfg.get("MAX_TX_PER_BLOCK", 200)))
 
     # ==================================================================== #
     # Lifecycle
@@ -72,6 +86,127 @@ class Node:
                 self.peers.add(None, host or "127.0.0.1", int(port or 8000))
 
     # ==================================================================== #
+    # Tunable parameters (node-local, non-consensus)
+    # ==================================================================== #
+    PARAM_HISTORY_LIMIT = 500
+
+    def _load_param_settings(self):
+        """Overlay persisted tunable values onto the startup configuration."""
+        self._param_history = read_json(self.paths.param_history_path, [])
+        saved = read_json(self.paths.settings_path, {}) or {}
+        for key, spec in TUNABLE_PARAM_SPECS.items():
+            if key not in saved:
+                continue
+            try:
+                value = coerce_param(key, saved[key])
+            except (TypeError, ValueError):
+                self.log("warn", f"忽略已保存的非法参数值: {key}={saved[key]!r}")
+                continue
+            ok, _msg = validate_param(key, value)
+            if not ok:
+                self.log("warn", f"忽略超出范围的已保存参数: {key}={value!r}")
+                continue
+            self.cfg[key] = value
+        # Keep the historical lowercase alias used by the mining loop in sync.
+        self.cfg["mining_interval"] = self.cfg["MINING_INTERVAL"]
+
+    def tunable_params(self):
+        """Return current/default/range metadata for every tunable parameter."""
+        out = []
+        for key, spec in TUNABLE_PARAM_SPECS.items():
+            out.append({
+                "key": key,
+                "label": spec["label"],
+                "unit": spec["unit"],
+                "type": spec["type"],
+                "step": spec["step"],
+                "help": spec.get("help", ""),
+                "default": spec["default"],
+                "min": spec["min"],
+                "max": spec["max"],
+                "current": self.cfg.get(key, spec["default"]),
+                "is_default": self.cfg.get(key) == spec["default"],
+            })
+        return out
+
+    def _record_param_change(self, key, old, new, source="ui"):
+        entry = {"time": time.time(), "key": key, "old": old, "new": new,
+                 "source": source}
+        self._param_history.append(entry)
+        self._param_history = self._param_history[-self.PARAM_HISTORY_LIMIT:]
+        atomic_write_json(self.paths.param_history_path, self._param_history)
+        return entry
+
+    def param_history(self, limit=100):
+        return list(reversed(self._param_history[-limit:]))
+
+    def update_params(self, updates, source="ui"):
+        """Validate and atomically apply a ``{key: value}`` parameter batch.
+
+        Every value is range-checked first; if any is invalid nothing is
+        applied, persisted, or recorded.  Returns ``(applied, errors)`` where
+        ``applied`` is the list of audit entries for changed values.
+        """
+        if not isinstance(updates, dict):
+            return [], {"_": "请求格式必须是参数键值映射"}
+        # Phase 1: reject unknown keys and coerce/validate everything before
+        # touching any live state, so an out-of-range value can never leave a
+        # half-applied batch.
+        coerced, errors = {}, {}
+        for key, raw in updates.items():
+            if key not in TUNABLE_PARAM_SPECS:
+                errors[key] = "未知参数"
+                continue
+            try:
+                value = coerce_param(key, raw)
+            except (TypeError, ValueError) as e:
+                errors[key] = str(e)
+                continue
+            ok, msg = validate_param(key, value)
+            if not ok:
+                errors[key] = msg
+                continue
+            coerced[key] = value
+        if errors:
+            return [], errors
+
+        # Phase 2: apply, persist, and audit (under one lock with the mining
+        # thread so reads always see a consistent set).
+        applied = []
+        with self._lock:
+            for key, value in coerced.items():
+                old = self.cfg.get(key, TUNABLE_PARAM_SPECS[key]["default"])
+                if old == value:
+                    continue
+                self.cfg[key] = value
+                if key == "MINING_INTERVAL":
+                    self.cfg["mining_interval"] = value
+                entry = self._record_param_change(key, old, value, source)
+                applied.append(entry)
+            if applied:
+                persisted = {k: self.cfg[k] for k in TUNABLE_PARAM_SPECS}
+                atomic_write_json(self.paths.settings_path, persisted)
+                for e in applied:
+                    self.log("info",
+                             f"参数 {e['key']} 已从 {e['old']:g} 调整为 {e['new']:g}")
+            if any(e["key"] == "MAX_TX_PER_BLOCK" for e in applied):
+                # Applies to subsequent admissions / block packaging immediately.
+                self.txpool.set_max_size(int(self.cfg["MAX_TX_PER_BLOCK"]))
+            # Short-circuit any in-progress cadence wait so the new interval
+            # governs the very next block; the node/thread never restarts.
+            if any(e["key"] == "MINING_INTERVAL" for e in applied) and self._mining:
+                self._mining_wake.set()
+        return applied, {}
+
+    def reset_params(self, source="ui"):
+        """Restore every tunable parameter to its built-in default.
+
+        Only values that actually differ generate audit entries, so a reset
+        when everything is already at the default is a harmless no-op.
+        """
+        return self.update_params(tunable_defaults(), source=source)
+
+    # ==================================================================== #
     # Logging
     # ==================================================================== #
     def log(self, level, message):
@@ -92,7 +227,8 @@ class Node:
         with self._lock:
             miner = miner_address or (self.wallets.list()[0]["address"]
                                       if self.wallets.list() else ZERO_ADDRESS)
-            candidates = self.txpool.all()[:MAX_TX_PER_BLOCK]
+            tx_cap = int(self.cfg.get("MAX_TX_PER_BLOCK", 200))
+            candidates = self.txpool.all()[:tx_cap]
             index = self.blockchain.height + 1
             coinbase = create_coinbase(miner, COINBASE_REWARD, index)
             txs = [coinbase] + candidates
@@ -131,6 +267,7 @@ class Node:
         if self._mining:
             return False
         self._mining = True
+        self._mining_wake.clear()
         self._mine_thread = threading.Thread(target=self._mining_loop,
                                              daemon=True)
         self._mine_thread.start()
@@ -139,17 +276,25 @@ class Node:
 
     def stop_mining(self):
         self._mining = False
+        self._mining_wake.set()
         self.log("info", "auto-mining stopped")
         return True
 
     def _mining_loop(self):
-        interval = self.cfg.get("mining_interval", MINING_INTERVAL)
+        # The cadence is re-read (with the event's remaining-time cleared) on
+        # every pass, so saving a new MINING_INTERVAL affects the upcoming
+        # blocks immediately without restarting the node.
         while self._mining:
+            interval = self.cfg.get("MINING_INTERVAL",
+                                   self.cfg.get("mining_interval", 3.0))
             try:
                 self.mine_block()
             except Exception as e:  # noqa: BLE001
                 self.log("error", f"mining error: {e}")
-            time.sleep(interval)
+            # Interruptible wait: a parameter save wakes the loop, after which
+            # the new interval is honoured; otherwise we sleep the full cadence.
+            self._mining_wake.wait(timeout=max(0.0, float(interval)))
+            self._mining_wake.clear()
 
     @property
     def mining(self):

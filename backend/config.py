@@ -40,6 +40,8 @@ TXPOOL_FILE = "txpool.json"
 WALLETS_FILE = "wallets.json"
 VERSIONS_FILE = "versions.json"
 LOGS_FILE = "logs.json"
+SETTINGS_FILE = "settings.json"
+PARAM_HISTORY_FILE = "param_history.json"
 CONTRACTS_SUBDIR = "contracts"
 
 # ---------------------------------------------------------------------------
@@ -76,6 +78,79 @@ DEFAULT_NODES = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Node-local tunable parameters
+#
+# Only *operational*, non-consensus knobs may be tuned at runtime: they affect
+# a single node's behaviour only, never block/tx validity, so changing them
+# cannot fork the chain or desynchronise consensus.  Consensus-critical values
+# (reward, difficulty, future drift, …) are deliberately absent and stay
+# fixed constants.  Each entry carries a legal range so every update can be
+# validated before it is applied, and a default so values can be restored.
+# ---------------------------------------------------------------------------
+# key -> (default, minimum, maximum, type, human label, unit)
+TUNABLE_PARAM_SPECS = {
+    "MINING_INTERVAL": {
+        "default": MINING_INTERVAL, "min": 0.2, "max": 3600.0,
+        "type": "float", "label": "挖矿间隔", "unit": "秒",
+        "step": 0.1,
+        "help": "自动挖矿两轮之间的等待时间，仅影响本节点节奏。",
+    },
+    "MAX_TX_PER_BLOCK": {
+        "default": MAX_TX_PER_BLOCK, "min": 1, "max": 10000,
+        "type": "int", "label": "每块交易上限", "unit": "笔",
+        "step": 1,
+        "help": "本节点打包候选区块时最多纳入的交易数量。",
+    },
+    "SANDBOX_TIMEOUT": {
+        "default": SANDBOX_TIMEOUT, "min": 0.1, "max": 30.0,
+        "type": "float", "label": "合约沙箱超时", "unit": "秒",
+        "step": 0.1,
+        "help": "单次合约执行的墙钟时间上限，超时即中止。",
+    },
+}
+
+TUNABLE_PARAM_KEYS = tuple(TUNABLE_PARAM_SPECS.keys())
+
+
+def tunable_defaults():
+    """Return a fresh ``{key: default}`` mapping of tunable parameters."""
+    return {k: spec["default"] for k, spec in TUNABLE_PARAM_SPECS.items()}
+
+
+def coerce_param(key, raw):
+    """Coerce an inbound JSON value to the parameter's declared type.
+
+    Raises :class:`ValueError` when the value is missing, not numeric, or
+    (for ints) not integral.
+    """
+    spec = TUNABLE_PARAM_SPECS.get(key)
+    if spec is None:
+        raise ValueError(f"未知参数: {key}")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError("必须是数字")
+    if spec["type"] == "int":
+        if isinstance(raw, float) and not raw.is_integer():
+            raise ValueError("必须是整数")
+        return int(raw)
+    return float(raw)
+
+
+def validate_param(key, value):
+    """Validate an already-coerced value against the parameter's range.
+
+    Returns ``(ok, message)``; ``message`` describes the legal range on
+    failure so callers can surface it to the user.
+    """
+    spec = TUNABLE_PARAM_SPECS[key]
+    lo, hi = spec["min"], spec["max"]
+    if value != value:  # NaN guard
+        return False, "数值无效（NaN）"
+    if value < lo or value > hi:
+        return False, f"取值需在 {lo:g} ~ {hi:g} {spec['unit']}之间"
+    return True, "ok"
+
+
 def build_config(args):
     """Fold command-line arguments into a node configuration dictionary."""
     cfg = {
@@ -86,25 +161,25 @@ def build_config(args):
                     or os.path.join("data", getattr(args, "id", "node1")),
         "peers": [],
         "mine": bool(getattr(args, "mine", False)),
-        "mining_interval": MINING_INTERVAL,
         # Consensus / storage / sandbox constants are folded in so the rest of
-        # the code can read them uniformly via cfg.get(...).
+        # the code can read them uniformly via cfg.get(...).  The tunable set is
+        # sourced from TUNABLE_PARAM_SPECS so defaults stay in one place.
         "INITIAL_DIFFICULTY_BITS": INITIAL_DIFFICULTY_BITS,
         "TARGET_BLOCK_TIME": TARGET_BLOCK_TIME,
         "DIFFICULTY_ADJUST_INTERVAL": DIFFICULTY_ADJUST_INTERVAL,
         "DIFFICULTY_ADJUST_MAX_FACTOR": DIFFICULTY_ADJUST_MAX_FACTOR,
         "DIFFICULTY_ADJUST_MIN_FACTOR": DIFFICULTY_ADJUST_MIN_FACTOR,
         "COINBASE_REWARD": COINBASE_REWARD,
-        "MAX_TX_PER_BLOCK": MAX_TX_PER_BLOCK,
         "MAX_BLOCK_FUTURE_DRIFT": MAX_BLOCK_FUTURE_DRIFT,
-        "MINING_INTERVAL": MINING_INTERVAL,
         "PEER_DIAL_TIMEOUT": PEER_DIAL_TIMEOUT,
-        "SANDBOX_TIMEOUT": SANDBOX_TIMEOUT,
         "SANDBOX_MAX_PRINT": SANDBOX_MAX_PRINT,
         "CONTRACT_MAX_STATE_KEYS": CONTRACT_MAX_STATE_KEYS,
         "CONTRACT_MAX_EVENTS": CONTRACT_MAX_EVENTS,
         "CONTRACT_MAX_CODE_BYTES": CONTRACT_MAX_CODE_BYTES,
     }
+    cfg.update(tunable_defaults())
+    # Mirror the auto-mining cadence under its historical lowercase key too.
+    cfg["mining_interval"] = cfg["MINING_INTERVAL"]
     if getattr(args, "peers", None):
         cfg["peers"] = [p for p in args.peers.split(",") if p]
     if getattr(args, "seed", False):

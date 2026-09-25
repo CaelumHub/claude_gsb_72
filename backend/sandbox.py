@@ -21,6 +21,7 @@ filesystem, or the network.
 import ast
 import io
 import sys
+import time
 
 # --------------------------------------------------------------------------- #
 # Denylist / allowlist of builtins
@@ -167,14 +168,21 @@ class OutputBuffer(io.StringIO):
 
 
 class _InstructionLimiter:
-    """Counts trace events; raises once the budget is exhausted."""
+    """Counts trace events; raises once the budget or wall-clock deadline is hit."""
 
-    def __init__(self, budget):
+    def __init__(self, budget, deadline=None):
         self.budget = budget
+        self.deadline = deadline
         self.count = 0
 
     def __call__(self, frame, event, arg):
         self.count += 1
+        # The settrace callback fires per bytecode step (not per source line), so
+        # checking the wall-clock deadline here bounds real execution time even
+        # for tight infinite loops that never yield.
+        if self.deadline is not None and self.count % 64 == 0:
+            if time.monotonic() >= self.deadline:
+                raise SandboxError("contract execution timed out")
         if self.count > self.budget:
             raise SandboxError("contract exceeded the instruction budget")
         return self
@@ -193,11 +201,13 @@ def build_restricted_builtins(print_fn):
     return env
 
 
-def exec_restricted(code, context, instruction_budget=200_000, output_limit=50_000):
+def exec_restricted(code, context, instruction_budget=200_000,
+                    output_limit=50_000, timeout=None):
     """Execute contract source in a restricted environment.
 
     ``context`` is a dict of globals exposed to the contract (``state``, ``msg``,
-    ``emit``, …).  Returns ``{"ok": bool, "output": str, "error": str|None,
+    ``emit``, …).  ``timeout`` bounds wall-clock execution in seconds.
+    Returns ``{"ok": bool, "output": str, "error": str|None,
     "instructions": int}``.  Never raises to the caller.
     """
     out = OutputBuffer(output_limit)
@@ -210,7 +220,8 @@ def exec_restricted(code, context, instruction_budget=200_000, output_limit=50_0
 
     env = dict(context)
     env["__builtins__"] = build_restricted_builtins(out.write)
-    limiter = _InstructionLimiter(instruction_budget)
+    deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
+    limiter = _InstructionLimiter(instruction_budget, deadline)
 
     old_trace = sys.gettrace()
     sys.settrace(limiter)
@@ -243,7 +254,10 @@ def call_function(code, function_name, args, context, **kwargs):
 
     env = dict(context)
     env["__builtins__"] = build_restricted_builtins(out.write)
-    limiter = _InstructionLimiter(kwargs.get("instruction_budget", 200_000))
+    timeout = kwargs.get("timeout")
+    deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
+    limiter = _InstructionLimiter(kwargs.get("instruction_budget", 200_000),
+                                 deadline)
 
     old_trace = sys.gettrace()
     sys.settrace(limiter)

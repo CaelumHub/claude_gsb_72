@@ -111,11 +111,15 @@ def create_app(node):
             "node_id": node.node_id, "host": node.host, "port": node.port,
             "data_dir": node.paths.root,
             "mining": node.mining,
-            "mining_interval": node.cfg.get("mining_interval", 3.0),
+            "mining_interval": node.cfg.get("MINING_INTERVAL",
+                                          node.cfg.get("mining_interval", 3.0)),
             "initial_difficulty": node.blockchain.genesis_difficulty,
             "coinbase_reward": node.cfg.get("COINBASE_REWARD", 50.0),
             "max_tx_per_block": node.cfg.get("MAX_TX_PER_BLOCK", 200),
             "sandbox_timeout": node.cfg.get("SANDBOX_TIMEOUT", 3.0),
+            # Every node-local tunable with its current value, built-in
+            # default, and legal range for the settings UI.
+            "params": node.tunable_params(),
             "peers": [p.to_dict() for p in node.peers.all()],
         })
 
@@ -123,9 +127,22 @@ def create_app(node):
     def update_network_config():
         data = request.get_json(force=True, silent=True) or {}
         changed = []
-        if "mining_interval" in data:
-            node.cfg["mining_interval"] = float(data["mining_interval"])
-            changed.append("mining_interval")
+        # Node-local tunables are range-validated atomically inside the node:
+        # an out-of-range value rejects the whole parameter batch.
+        if "params" in data and isinstance(data["params"], dict):
+            applied, errors = node.update_params(data["params"])
+            if errors:
+                return _json({"ok": False, "error": "参数校验未通过",
+                              "errors": errors}, 400)
+            changed.extend(e["key"] for e in applied)
+        # Backwards-compatible shorthand used by older clients.
+        if "mining_interval" in data and "params" not in data:
+            applied, errors = node.update_params(
+                {"MINING_INTERVAL": data["mining_interval"]})
+            if errors:
+                return _json({"ok": False, "error": "参数校验未通过",
+                              "errors": errors}, 400)
+            changed.extend(e["key"] for e in applied)
         if "auto_mine" in data:
             if data["auto_mine"] and not node.mining:
                 node.start_mining()
@@ -133,6 +150,24 @@ def create_app(node):
                 node.stop_mining()
             changed.append("auto_mine")
         return _json({"ok": True, "changed": changed})
+
+    @app.get("/api/network/params/history")
+    def params_history():
+        try:
+            limit = min(500, max(1, int(request.args.get("limit", 100))))
+        except (TypeError, ValueError):
+            limit = 100
+        return _json({"history": node.param_history(limit=limit)})
+
+    @app.post("/api/network/params/reset")
+    def params_reset():
+        # The confirmation dialog is the safety gate against mis-clicks; the
+        # endpoint itself simply restores every tunable to its built-in
+        # default and records which values actually moved.
+        applied, errors = node.reset_params(source="ui-reset")
+        return _json({"ok": True, "changed": [e["key"] for e in applied],
+                      "reset": [e["key"] for e in applied],
+                      "history": applied})
 
     @app.post("/api/network/sync")
     def trigger_sync():

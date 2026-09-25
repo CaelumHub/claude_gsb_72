@@ -88,11 +88,11 @@ def http_post_json(url, payload, timeout=PEER_DIAL_TIMEOUT):
     return resp.json()
 
 
-def dial_peer(peer):
+def dial_peer(peer, timeout=PEER_DIAL_TIMEOUT):
     """Fetch a peer's status, updating its bookkeeping fields."""
     started = time.time()
     try:
-        data = http_get_json(f"{peer.url}/p2p/status", timeout=PEER_DIAL_TIMEOUT)
+        data = http_get_json(f"{peer.url}/p2p/status", timeout=timeout)
         peer.status = "up"
         peer.height = data.get("height")
         peer.head_hash = data.get("head_hash")

@@ -15,6 +15,7 @@ from .blockchain import Blockchain
 from .config import (COINBASE_REWARD, CONTRACT_EVENT_DEDUP_KEY,
                      MAX_TX_PER_BLOCK, MINING_INTERVAL)
 from .p2p import PeerRegistry, dial_peer, http_get_json, http_post_json
+from .settings import SettingsStore
 from .state import ZERO_ADDRESS
 from .storage import DataPaths, atomic_write_json, read_json
 from .transaction import (Transaction, create_call, create_coinbase,
@@ -33,6 +34,9 @@ class Node:
 
         self.paths = DataPaths(cfg.get("data_dir", "data"), cfg)
         self.paths.ensure()
+        # Restore any administrator-tuned operational parameters (validated)
+        # before constructing components that read their limits from cfg.
+        self.settings = SettingsStore(cfg, self.paths.settings_path)
         self.blockchain = Blockchain(cfg, self.paths)
         self.txpool = TxPool(max_size=cfg.get("MAX_TX_PER_BLOCK", 1000))
         self.wallets = WalletStore(self.paths.wallets_path)
@@ -40,6 +44,7 @@ class Node:
 
         self._mining = False
         self._mine_thread = None
+        self._mine_wake = threading.Event()
         self._lock = threading.RLock()
         self._logs = []
         self.hashrate = 0.0
@@ -92,7 +97,10 @@ class Node:
         with self._lock:
             miner = miner_address or (self.wallets.list()[0]["address"]
                                       if self.wallets.list() else ZERO_ADDRESS)
-            candidates = self.txpool.all()[:MAX_TX_PER_BLOCK]
+            # Read the cap live so a tuning change affects the next mined block
+            # without restarting the node.
+            tx_cap = int(self.cfg.get("MAX_TX_PER_BLOCK", MAX_TX_PER_BLOCK))
+            candidates = self.txpool.all()[:tx_cap]
             index = self.blockchain.height + 1
             coinbase = create_coinbase(miner, COINBASE_REWARD, index)
             txs = [coinbase] + candidates
@@ -131,6 +139,7 @@ class Node:
         if self._mining:
             return False
         self._mining = True
+        self._mine_wake.clear()
         self._mine_thread = threading.Thread(target=self._mining_loop,
                                              daemon=True)
         self._mine_thread.start()
@@ -139,17 +148,60 @@ class Node:
 
     def stop_mining(self):
         self._mining = False
+        # Wake the cadence wait immediately so the loop can exit / re-read the
+        # (possibly changed) interval without waiting out the old sleep.
+        self._mine_wake.set()
         self.log("info", "auto-mining stopped")
         return True
 
     def _mining_loop(self):
-        interval = self.cfg.get("mining_interval", MINING_INTERVAL)
+        # The interval is read on every iteration, so tuning it takes effect
+        # for the next block; the wake event makes a shorter interval apply
+        # immediately even while the old, longer wait is still in progress.
         while self._mining:
             try:
                 self.mine_block()
             except Exception as e:  # noqa: BLE001
                 self.log("error", f"mining error: {e}")
-            time.sleep(interval)
+            if not self._mining:
+                break
+            interval = max(0.0, float(self.cfg.get("mining_interval",
+                                                   MINING_INTERVAL)))
+            self._mine_wake.wait(interval)
+            self._mine_wake.clear()
+
+    # ==================================================================== #
+    # Runtime-tunable parameters
+    # ==================================================================== #
+    def update_settings(self, values, source="ui"):
+        """Validate + apply a batch of parameter changes and log the audit trail."""
+        applied = self.settings.update(values, source=source)
+        self._after_settings_change(applied)
+        return applied
+
+    def reset_settings(self, source="ui"):
+        """Restore all tunable parameters to defaults and log the change."""
+        applied = self.settings.reset_defaults(source=source)
+        self._after_settings_change(applied)
+        return applied
+
+    def _after_settings_change(self, applied):
+        """Propagate a settings change to components that cached the old value."""
+        if not applied:
+            return
+        keys = {c["key"] for c in applied}
+        if "max_tx_per_block" in keys:
+            # The pool caches its capacity at construction; keep them aligned.
+            self.txpool.max_size = int(self.cfg.get("MAX_TX_PER_BLOCK",
+                                                    MAX_TX_PER_BLOCK))
+        if "mining_interval" in keys:
+            # Interrupt the current cadence wait so the new interval applies now.
+            self._mine_wake.set()
+        for c in applied:
+            verb = "还原默认" if c.get("action") == "reset" else "修改"
+            self.log("info",
+                     f"参数{verb}: {c['label']} {c['old']:g} → {c['new']:g}"
+                     f"{c.get('unit', '')}")
 
     @property
     def mining(self):
@@ -216,17 +268,19 @@ class Node:
     # ==================================================================== #
     def broadcast_block(self, block):
         payload = block.to_dict()
+        timeout = float(self.cfg.get("PEER_DIAL_TIMEOUT", 3))
         for peer in self.peers.all():
             try:
-                http_post_json(f"{peer.url}/p2p/block", payload, timeout=3)
+                http_post_json(f"{peer.url}/p2p/block", payload, timeout=timeout)
             except Exception as e:  # noqa: BLE001
                 peer.last_error = str(e)[:120]
 
     def broadcast_tx(self, tx):
         payload = tx.to_dict()
+        timeout = float(self.cfg.get("PEER_DIAL_TIMEOUT", 3))
         for peer in self.peers.all():
             try:
-                http_post_json(f"{peer.url}/p2p/tx", payload, timeout=3)
+                http_post_json(f"{peer.url}/p2p/tx", payload, timeout=timeout)
             except Exception as e:  # noqa: BLE001
                 peer.last_error = str(e)[:120]
 
@@ -301,8 +355,9 @@ class Node:
         summary = {"checked": 0, "synced_blocks": 0, "reorgs": 0,
                    "best_peer": None, "errors": []}
         best = None
+        dial_timeout = float(self.cfg.get("PEER_DIAL_TIMEOUT", 3))
         for peer in self.peers.all():
-            up, data = dial_peer(peer)
+            up, data = dial_peer(peer, timeout=dial_timeout)
             summary["checked"] += 1
             if up and data.get("chainwork", 0) > self.blockchain.chainwork:
                 if best is None or data["chainwork"] > best[1].get("chainwork", 0):
@@ -319,7 +374,8 @@ class Node:
             try:
                 batch = http_get_json(
                     f"{peer.url}/p2p/blocks?from={next_h}&to="
-                    f"{min(next_h + 100, target_height)}", timeout=5)
+                    f"{min(next_h + 100, target_height)}",
+                    timeout=float(self.cfg.get("PEER_DIAL_TIMEOUT", 3)) * 2)
             except Exception as e:  # noqa: BLE001
                 summary["errors"].append(f"sync failed at height {next_h}: {e}")
                 break
@@ -337,10 +393,11 @@ class Node:
 
     def announce(self):
         """Ask peers to consider us (used by non-seed nodes on startup)."""
+        timeout = float(self.cfg.get("PEER_DIAL_TIMEOUT", 3))
         for peer in self.peers.all():
             try:
                 http_post_json(f"{peer.url}/p2p/announce", {
                     "id": self.node_id, "host": self.host, "port": self.port,
-                }, timeout=3)
+                }, timeout=timeout)
             except Exception:  # noqa: BLE001
                 pass

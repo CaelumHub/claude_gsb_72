@@ -12,6 +12,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 from . import crypto
+from .settings import SettingsError
 from .state import ZERO_ADDRESS
 from .storage import read_json, atomic_write_json
 from .transaction import Transaction
@@ -123,9 +124,17 @@ def create_app(node):
     def update_network_config():
         data = request.get_json(force=True, silent=True) or {}
         changed = []
+        # The mining interval is a range-checked tunable parameter: route it
+        # through the settings store so the same validation/audit rules apply.
         if "mining_interval" in data:
-            node.cfg["mining_interval"] = float(data["mining_interval"])
-            changed.append("mining_interval")
+            try:
+                applied = node.update_settings(
+                    {"mining_interval": data["mining_interval"]},
+                    source="network-config")
+            except SettingsError as e:
+                return _json({"ok": False, "error": str(e)}, 400)
+            if applied:
+                changed.append("mining_interval")
         if "auto_mine" in data:
             if data["auto_mine"] and not node.mining:
                 node.start_mining()
@@ -133,6 +142,50 @@ def create_app(node):
                 node.stop_mining()
             changed.append("auto_mine")
         return _json({"ok": True, "changed": changed})
+
+    # ================================================================== #
+    # Runtime-tunable parameters (validated + audited)
+    # ================================================================== #
+    @app.get("/api/settings/params")
+    def settings_params():
+        return _json({"params": node.settings.describe()})
+
+    @app.post("/api/settings/update")
+    def settings_update():
+        data = request.get_json(force=True, silent=True) or {}
+        values = data.get("values", data)
+        if not isinstance(values, dict) or not values:
+            return _json({"ok": False,
+                          "error": "请至少提供一项需要修改的参数"}, 400)
+        try:
+            applied = node.update_settings(values, source="ui")
+        except SettingsError as e:
+            return _json({"ok": False, "error": str(e)}, 400)
+        if not applied:
+            return _json({"ok": True, "changed": [],
+                          "message": "所有参数均为当前值，无需修改"})
+        return _json({"ok": True, "changed": [
+            {"key": c["key"], "label": c["label"], "old": c["old"],
+             "new": c["new"], "unit": c.get("unit", "")}
+            for c in applied]})
+
+    @app.post("/api/settings/reset")
+    def settings_reset():
+        # Confirmation is enforced in the UI; the endpoint itself is a plain
+        # restore-to-defaults call that records every value it changes.
+        applied = node.reset_settings(source="ui")
+        return _json({"ok": True, "changed": [
+            {"key": c["key"], "label": c["label"], "old": c["old"],
+             "new": c["new"], "unit": c.get("unit", "")}
+            for c in applied]})
+
+    @app.get("/api/settings/history")
+    def settings_history():
+        try:
+            limit = int(request.args.get("limit", 100))
+        except ValueError:
+            limit = 100
+        return _json({"history": node.settings.changes(limit)})
 
     @app.post("/api/network/sync")
     def trigger_sync():

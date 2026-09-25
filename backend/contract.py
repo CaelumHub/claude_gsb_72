@@ -101,7 +101,12 @@ class ContractEngine:
         self.cfg = cfg
         self.max_keys = cfg.get("CONTRACT_MAX_STATE_KEYS", 2000)
         self.max_events = cfg.get("CONTRACT_MAX_EVENTS", 1000)
-        self.max_print = cfg.get("SANDBOX_MAX_PRINT", 50_000)
+
+    @property
+    def max_print(self):
+        # Read live so an administrator-tuned output cap applies to the next
+        # contract execution without restarting the node.
+        return self.cfg.get("SANDBOX_MAX_PRINT", 50_000)
 
     # -- context ----------------------------------------------------------- #
     def build_context(self, world_state, contract_addr, sender, value, height):

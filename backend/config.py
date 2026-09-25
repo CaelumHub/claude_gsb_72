@@ -40,6 +40,7 @@ TXPOOL_FILE = "txpool.json"
 WALLETS_FILE = "wallets.json"
 VERSIONS_FILE = "versions.json"
 LOGS_FILE = "logs.json"
+SETTINGS_FILE = "settings.json"
 CONTRACTS_SUBDIR = "contracts"
 
 # ---------------------------------------------------------------------------
@@ -74,6 +75,52 @@ DEFAULT_NODES = [
     {"id": "node2", "port": 8001, "seed": False},
     {"id": "node3", "port": 8002, "seed": False},
 ]
+
+
+# ---------------------------------------------------------------------------
+# Runtime-tunable per-node parameters
+#
+# Only *operational*, node-local parameters are tunable at runtime: changing
+# them never alters consensus rules (block validity, reward schedule, difficulty)
+# and takes effect for subsequent work without restarting the node.  Each entry
+# declares the value type, inclusive legal range, unit and a human label so the
+# API can range-check submissions and the settings page can show current value
+# next to the built-in default.  Consensus-critical constants (reward, bits,
+# difficulty schedule, future drift, ...) stay intentionally fixed above.
+#
+# ``cfg_key`` is the key used inside the node's ``cfg`` dict; ``key`` is the
+# stable external/API name (which is also how the value is persisted).
+# ---------------------------------------------------------------------------
+TUNABLE_PARAMS = {
+    "mining_interval": {
+        "cfg_key": "mining_interval",
+        "label": "挖矿间隔（秒）",
+        "description": "自动挖矿时相邻两次出块尝试之间的等待秒数，保存后立即对下一轮挖矿生效。",
+        "type": "float", "min": 0.2, "max": 3600.0, "step": 0.1,
+        "unit": "s", "default": MINING_INTERVAL,
+    },
+    "max_tx_per_block": {
+        "cfg_key": "MAX_TX_PER_BLOCK",
+        "label": "每块交易上限",
+        "description": "本节点打包新区块时最多装入的交易数量（仅影响本地打包，不改变共识校验）。",
+        "type": "int", "min": 1, "max": 10000, "step": 1,
+        "unit": "笔", "default": MAX_TX_PER_BLOCK,
+    },
+    "sandbox_max_print": {
+        "cfg_key": "SANDBOX_MAX_PRINT",
+        "label": "合约输出上限（字节）",
+        "description": "智能合约单次执行允许 print 的最大字节数，对之后的合约执行生效。",
+        "type": "int", "min": 1024, "max": 1_000_000, "step": 1024,
+        "unit": "B", "default": SANDBOX_MAX_PRINT,
+    },
+    "peer_dial_timeout": {
+        "cfg_key": "PEER_DIAL_TIMEOUT",
+        "label": "邻居拨号超时（秒）",
+        "description": "访问邻居节点 HTTP 接口的超时秒数，对之后的 P2P 请求生效。",
+        "type": "float", "min": 0.5, "max": 60.0, "step": 0.5,
+        "unit": "s", "default": PEER_DIAL_TIMEOUT,
+    },
+}
 
 
 def build_config(args):
